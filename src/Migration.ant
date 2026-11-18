@@ -1,0 +1,43 @@
+// Migrations: numbered steps from one model of the database to the next, written by `larva nest migrate add` (and
+// editable: data moves, defaults). Database.Migrate applies the ones a database has not seen, each in its transaction,
+// and notes them in its `__nest_migrations` table.
+
+import System;
+import System.Data;
+
+into namespace Nest
+{
+	public base class Migration
+	{
+		i64 id;
+		str name;
+
+		public:
+			new(i64 id, str name)
+			{
+				this.id = id;
+				this.name = name;
+			}
+
+			/// Its number: migrations run in this order.
+			i64 Id { get => id; }
+
+			str Name { get => name; }
+
+			/// From the model before to this one.
+			Up(Database db);
+
+			/// Back to the model before.
+			Down(Database db);
+	}
+
+	/// What Migrate and Revert did.
+	public final class MigrationReport
+	{
+		public:
+			i32 Applied;
+			List<str> Names;
+
+			new() { Applied = 0; Names = new List<str>(); }
+	}
+}

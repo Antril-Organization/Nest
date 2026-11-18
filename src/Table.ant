@@ -1,0 +1,253 @@
+// A table of entities: its statements prepared once (on first use) and kept, so adding, finding and updating is binding
+// and stepping, nothing else.
+
+import System;
+import System.Data;
+
+into namespace Nest
+{
+	public final class Table<T : IEntity<T>, class, new()>
+	{
+		Connection connection;
+		Command? insert;
+		Command? update;
+		Command? remove;
+		Command? find;
+		/// The statements of queries, by their places (Query.Prepare), each free to run.
+		Dictionary<i64, List<Prepared>> statements;
+
+		Kept(Command? kept, str sql) : Command
+		{
+			if (kept is Command ready)
+				return ready;
+			return connection.Prepare(sql);
+		}
+
+		public:
+			new(Connection connection)
+			{
+				this.connection = connection;
+				statements = new Dictionary<i64, List<Prepared>>();
+			}
+
+			/// Every row, as a query to narrow: `db.Users.Query().OrderBy(u => u.Name)`.
+			Query() : Query<T> => new Query<T>(this);
+
+			/// The rows `test` holds for (`u => u.Age >= limit`): SQL made from the function once, its captures bound at each run.
+			Where([CompileWith("Nest.Sql.Where")] const func<T> : bool test) : Query<T> => new Query<T>(this).Where(test);
+
+			/// In the order of `field` (`u => u.Name`).
+			OrderBy<K>([CompileWith("Nest.Sql.Order")] const func<T> : K field) : Query<T> => new Query<T>(this).OrderBy(field);
+
+			/// The prepared statement of a query's places (`which`), free to run: kept from before, else made now.
+			Statement(i64 which, Query<T> query) : Prepared
+			{
+				if (statements.ContainsKey(which))
+				{
+					List<Prepared> free = statements.Get(which);
+					if (free.Count > 0)
+						return free.Pop();
+				}
+				return query.Prepare(connection, which);
+			}
+
+			/// A statement Statement gave, done with: reset and kept for the next run.
+			Release(i64 which, Prepared prepared)
+			{
+				prepared.Command.Reset();
+				if (!statements.ContainsKey(which))
+					statements.Set(which, new List<Prepared>());
+				statements.Get(which).Add(prepared);
+			}
+
+			/// How many rows the last statement changed.
+			Changes() : i64 => connection.QueryI64("SELECT changes()", 0);
+
+			/// Creates the table when it is not there.
+			Create() { connection.Execute(T.CreateSql()); }
+
+			/// The table as the model describes it (IEntity.Schema).
+			static Schema() : str => T.Schema();
+
+			/// Adds the entity (an integer key is set to the one the database made).
+			Add(T item)
+			{
+				Command command = Kept(insert, T.InsertSql());
+				insert = command;
+				item.BindInsert(command);
+				command.Run();
+				item.SetGeneratedKey(connection.LastInsertId());
+			}
+
+			/// Adds them all in one transaction.
+			AddAll(List<T> items)
+			{
+				connection.InTransaction(() =>
+				{
+					loop (T item in items)
+						Add(item);
+				});
+			}
+
+			/// Writes the entity's columns to its row: whether there was one.
+			Update(T item) : bool
+			{
+				Command command = Kept(update, T.UpdateSql());
+				update = command;
+				item.BindUpdate(command);
+				return command.Run() > 0;
+			}
+
+			/// Deletes the entity's row: whether there was one.
+			Remove(T item) : bool
+			{
+				Command command = Kept(remove, T.DeleteSql());
+				remove = command;
+				item.BindKey(command, 1);
+				return command.Run() > 0;
+			}
+
+			/// The entity with this key, or null.
+			Find(i64 key) : T?
+			{
+				Command command = Kept(find, T.SelectSql() + T.KeyCondition());
+				find = command;
+				command.Bind(1, key);
+				T? found = null;
+				if (command.Step())
+					found = T.Read(command);
+				command.Reset();
+				return found;
+			}
+
+			/// The entity with this key, or null.
+			Find(str key) : T?
+			{
+				Command command = Kept(find, T.SelectSql() + T.KeyCondition());
+				find = command;
+				command.Bind(1, key);
+				T? found = null;
+				if (command.Step())
+					found = T.Read(command);
+				command.Reset();
+				return found;
+			}
+
+			/// Every row, read one at a time.
+			All() : Iterator<T> => Where("");
+
+			/// The rows `condition` (SQL after WHERE; "" for all) chooses, read one at a time.
+			Where(str condition) : Iterator<T>
+			{
+				Command command = connection.Prepare(condition.Length == 0 ? T.SelectSql() : T.SelectSql() + " WHERE " + condition);
+				try
+				{
+					loop (command.Step())
+						yield T.Read(command);
+				}
+				finally
+				{
+					command.Close();
+				}
+			}
+
+			/// How many rows the table has.
+			Count() : i64 => connection.QueryI64("SELECT count(*) FROM \"" + T.TableName() + "\"", 0);
+	}
+
+	/// A database: its connection, and the program's tables as fields of a class deriving this one.
+	public base class Database
+	{
+		Connection connection;
+
+		public:
+			new(Connection connection) { this.connection = connection; }
+
+			Connection Connection { get => connection; }
+
+			InTransaction(func body) { connection.InTransaction(body); }
+
+			Execute(str sql) : i64 => connection.Execute(sql);
+
+			Close() { connection.Close(); }
+
+			/// The numbers of the migrations this database has had, in order.
+			Applied() : List<i64>
+			{
+				EnsureHistory();
+				List<i64> ids = new List<i64>();
+				Command command = connection.Prepare("SELECT id FROM __nest_migrations ORDER BY id");
+				loop (command.Step())
+					ids.Add(command.GetI64(0));
+				command.Close();
+				return ids;
+			}
+
+			/// Applies, in order, each of `migrations` this database has not had: each in a transaction with its note in
+			/// `__nest_migrations` (a migration that fails leaves the database as the one before it left it).
+			Migrate(List<Migration> migrations) : MigrationReport
+			{
+				HashSet<i64> done = AppliedSet();
+				List<Migration> pending = new List<Migration>();
+				loop (Migration m in migrations)
+					if (!done.Contains(m.Id))
+						pending.Add(m);
+				pending.Sort((a, b) => a.Id < b.Id ? -1 : a.Id > b.Id ? 1 : 0);
+				MigrationReport report = new MigrationReport();
+				loop (Migration m in pending)
+				{
+					Migration step = m;
+					connection.InTransaction(() =>
+					{
+						step.Up(this);
+						Command note = connection.Prepare("INSERT INTO __nest_migrations (id, name) VALUES (?1, ?2)");
+						note.Bind(1, step.Id);
+						note.Bind(2, step.Name);
+						note.Run();
+						note.Close();
+					});
+					report.Applied++;
+					report.Names.Add(step.Name);
+				}
+				return report;
+			}
+
+			/// Undoes, newest first, the migrations applied after number `target` (0: all of them).
+			Revert(List<Migration> migrations, i64 target) : MigrationReport
+			{
+				HashSet<i64> done = AppliedSet();
+				List<Migration> undo = new List<Migration>();
+				loop (Migration m in migrations)
+					if (m.Id > target && done.Contains(m.Id))
+						undo.Add(m);
+				undo.Sort((a, b) => a.Id > b.Id ? -1 : a.Id < b.Id ? 1 : 0);
+				MigrationReport report = new MigrationReport();
+				loop (Migration m in undo)
+				{
+					Migration step = m;
+					connection.InTransaction(() =>
+					{
+						step.Down(this);
+						Command note = connection.Prepare("DELETE FROM __nest_migrations WHERE id = ?1");
+						note.Bind(1, step.Id);
+						note.Run();
+						note.Close();
+					});
+					report.Applied++;
+					report.Names.Add(step.Name);
+				}
+				return report;
+			}
+
+		inherited:
+			AppliedSet() : HashSet<i64>
+			{
+				HashSet<i64> done = new HashSet<i64>();
+				loop (i64 id in Applied())
+					done.Add(id);
+				return done;
+			}
+
+			EnsureHistory() { connection.Execute("CREATE TABLE IF NOT EXISTS __nest_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"); }
+	}
+}

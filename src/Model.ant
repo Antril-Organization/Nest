@@ -1,0 +1,34 @@
+// A database's model: the tables it has (its `Table<T>` fields), as `larva nest` compares them with the last migration.
+// `class Shop : Database, IModel<Shop>` is enough: the compiler writes Model and OpenTables into Shop, one statement per
+// table.
+
+import System;
+import System.Data;
+
+into namespace Nest
+{
+	public interface IModel<TSelf : IModel<TSelf>>
+	{
+		/// Every table's schema (IEntity.Schema), in the order of the fields.
+		derive static Model() : str
+		{
+			str text = "";
+			static loop (field F f in TSelf)
+			{
+				static if (f.TypeName.StartsWith("Table<") || f.TypeName.Contains(".Table<"))
+					text = text + F.Schema();
+			}
+			return text;
+		}
+
+		/// Makes every `Table<T>` field a table on `connection` (call it in the constructor).
+		derive OpenTables(Connection connection)
+		{
+			static loop (field F f in TSelf)
+			{
+				static if (f.TypeName.StartsWith("Table<") || f.TypeName.Contains(".Table<"))
+					this.f = new F(connection);
+			}
+		}
+	}
+}

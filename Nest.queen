@@ -1,0 +1,12 @@
+queen 1.0;
+
+chunk PROJ:
+   name: Nest,
+   type: library,
+   version: v0.1,
+   author: Antril Organization,
+   description: Entities and tables over System.Data with the mapping made when compiling
+
+chunk HIVE:
+   package: Antril-Organization/Nest,
+   license: MIT

@@ -1,0 +1,31 @@
+// What an entity's fields say about their columns.
+
+import System;
+
+into namespace Nest
+{
+	/// The table's key. An integer key is made by the database when a row is added (Add sets it on the entity).
+	public attribute KeyAttribute { }
+
+	/// The column's name, when it is not the field's.
+	public attribute ColumnAttribute
+	{
+		public:
+			str Name;
+			new(str Name);
+	}
+
+	/// No two rows hold the same value in this column.
+	public attribute UniqueAttribute { }
+
+	/// The field is not a column.
+	public attribute IgnoreAttribute { }
+
+	/// The column was called `From` before: a migration renames it (its data stays) instead of dropping one and adding another.
+	public attribute RenamedAttribute
+	{
+		public:
+			str From;
+			new(str From);
+	}
+}

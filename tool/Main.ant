@@ -1,0 +1,366 @@
+// `larva nest`: migrations from the model a project's code declares. The model is read by building the project with a
+// small program of this tool's (its entry in place of the project's Main) that prints the IModel class's Model(), and is
+// compared with the one the last migration left (migrations/model.txt).
+
+import System;
+import System.IO;
+import System.Diagnostics;
+
+into namespace NestTool
+{
+	/// What went wrong, said for the person (the tool stops with exit code 1).
+	public class ToolError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// The project the tool works on: its file, folder, IModel class and migrations.
+	public final class Project
+	{
+		public:
+			str Queen;
+			str Folder;
+			str Migrations;
+			/// The IModel class, with its namespace (`Shop.Data.ShopDb`), and the namespace alone ("" for none).
+			str ModelClass;
+			str Namespace;
+
+			new(str? chosen)
+			{
+				str? queen = Environment.GetEnvironmentVariable("LARVA_PROJECT");
+				if (queen is not str file)
+					throw new ToolError("run it in a project (a folder with a .queen file): larva nest …");
+				Queen = file;
+				Folder = Path.GetDirectoryName(file);
+				Migrations = Path.Combine(Folder, "migrations");
+				ModelClass = "";
+				Namespace = "";
+				FindModel(chosen);
+			}
+
+			/// The model the code declares now (built and run: a few seconds).
+			Current() : Model => Model.Parse(ModelText());
+
+			/// The model the last migration left (empty without migrations).
+			Snapshot() : Model
+			{
+				str file = Path.Combine(Migrations, "model.txt");
+				return File.Exists(file) ? Model.Parse(File.ReadAllText(file)) : new Model();
+			}
+
+			/// The migration files there are, in order (`M0001_Init.ant`…).
+			MigrationFiles() : List<str>
+			{
+				List<str> found = new List<str>();
+				if (!Directory.Exists(Migrations))
+					return found;
+				loop (str name in Directory.GetEntries(Migrations))
+					if (IsMigrationFile(name))
+						found.Add(name);
+				return found;
+			}
+
+			/// The model's text: the project built with a program that prints its IModel class's Model(), then run.
+			ModelText() : str
+			{
+				str? larva = Environment.GetEnvironmentVariable("LARVA_EXE");
+				if (larva is not str exe)
+					throw new ToolError("LARVA_EXE is not set: run the tool as `larva nest …`");
+				// The project may name Migrations.All() before there is any migration: an empty one, until the first.
+				str index = Path.Combine(Migrations, "Migrations.ant");
+				if (!File.Exists(index))
+				{
+					Directory.CreateDirectory(Migrations);
+					File.WriteAllText(index, Writer.Index(Namespace, new List<str>()));
+				}
+				str work = Path.Combine(Folder, "obj", "nest");
+				Directory.CreateDirectory(work);
+				str design = Path.Combine(work, "Design.ant");
+				File.WriteAllText(design, "import System;\n\ninto namespace NestDesign\n{\n\tpublic static class Design\n\t{\n\t\tpublic:\n\t\t\tstatic Run() { Console.Write(" + ModelClass + ".Model()); }\n\t}\n}\n");
+				str program = Path.Combine(work, "design.exe");
+				ProcessResult built = Process.Run(exe, "build --backend x64 -O0 --entry NestDesign.Design.Run -o " + Quote(program) + " " + Quote(Queen) + " " + Quote(design));
+				if (built.ExitCode != 0)
+					throw new ToolError("the project does not build (its errors are above)");
+				ProcessResult ran = Process.Run(program, "");
+				if (ran.ExitCode != 0)
+					throw new ToolError(ModelClass + ".Model() failed:\n" + ran.Output);
+				return ran.Output;
+			}
+
+		private:
+			/// The class that implements IModel: the one named, or the only one in the project's sources.
+			FindModel(str? chosen)
+			{
+				List<str> classes = new List<str>();
+				List<str> spaces = new List<str>();
+				Scan(Folder, classes, spaces);
+				loop (i32 i = 0..classes.Count)
+				{
+					if (chosen is str name && classes[i] != name)
+						continue;
+					if (ModelClass.Length > 0)
+						throw new ToolError("the project has more than one IModel class: choose one with --db Name");
+					Namespace = spaces[i];
+					ModelClass = spaces[i].Length > 0 ? spaces[i] + "." + classes[i] : classes[i];
+				}
+				if (ModelClass.Length == 0)
+					throw new ToolError(chosen is str missing ? "no IModel class named " + missing + " in the project" : "no class in the project implements IModel (`class Shop : Database, IModel<Shop>`)");
+			}
+
+			/// The classes in the folder's sources (below it, not in bin, obj or hidden folders) whose bases name IModel.
+			Scan(str folder, List<str> classes, List<str> spaces)
+			{
+				loop (str name in Directory.GetEntries(folder))
+				{
+					str path = Path.Combine(folder, name);
+					if (Directory.Exists(path))
+					{
+						if (name != "bin" && name != "obj" && !name.StartsWith("."))
+							Scan(path, classes, spaces);
+						continue;
+					}
+					if (!name.EndsWith(".ant"))
+						continue;
+					str space = "";
+					loop (str raw in File.ReadAllText(path).Split('\n'))
+					{
+						str line = raw.Trim();
+						if (line.StartsWith("into namespace "))
+							space = line.Substring(15).Trim();
+						i32 at = line.IndexOf("class ");
+						if (at < 0 || line.IndexOf("IModel<") < 0)
+							continue;
+						str rest = line.Substring(at + 6).Trim();
+						i32 end = 0;
+						loop (end < rest.Length && rest[end] != ' ' && rest[end] != ':' && rest[end] != '<')
+							end++;
+						classes.Add(rest.Substring(0, end));
+						spaces.Add(space);
+					}
+				}
+			}
+
+			static Quote(str text) : str => "\"" + text + "\"";
+
+			/// `M0001_Name.ant`.
+			static IsMigrationFile(str name) : bool
+			{
+				if (name.Length < 11 || name[0] != 'M' || name[5] != '_' || !name.EndsWith(".ant"))
+					return false;
+				loop (i32 i = 1..5)
+					if (name[i] < '0' || name[i] > '9')
+						return false;
+				return true;
+			}
+	}
+
+	public static class Tool
+	{
+		public:
+			static Usage() : str => "usage: larva nest model                  the model the code declares (its tables and columns)\n" +
+				"       larva nest migrate add <Name>    a migration from the last one's model to the code's (migrations/)\n" +
+				"       larva nest migrate script        the SQL such a migration would run, written nowhere\n" +
+				"       larva nest migrate check         exit code 1 when the code's model has changes no migration has\n" +
+				"       larva nest migrate list          the migrations there are\n" +
+				"       (--db Name: the IModel class, when the project has more than one)\n";
+
+			static Run(List<str> words) : i32
+			{
+				str? chosen = null;
+				List<str> args = new List<str>();
+				loop (i32 i = 0..words.Count)
+				{
+					if (words[i] == "--db" && i + 1 < words.Count)
+					{
+						chosen = words[i + 1];
+						i++;
+					}
+					else
+						args.Add(words[i]);
+				}
+				if (args.Count == 0 || args[0] == "help" || args[0] == "--help")
+				{
+					Console.Write(Usage());
+					return args.Count == 0 ? 2 : 0;
+				}
+				Project project = new Project(chosen);
+				if (args[0] == "model")
+				{
+					Console.Write(project.ModelText());
+					return 0;
+				}
+				if (args[0] != "migrate" || args.Count < 2)
+				{
+					Console.Write(Usage());
+					return 2;
+				}
+				str command = args[1];
+				if (command == "list")
+				{
+					List<str> files = project.MigrationFiles();
+					loop (str file in files)
+						Console.WriteLine(file.Substring(0, file.Length - 4));
+					Console.WriteLine(files.Count == 0 ? "no migrations yet (larva nest migrate add Init)" : $"{files.Count} migration(s) in {project.Migrations}");
+					return 0;
+				}
+				str modelText = project.ModelText();
+				Steps steps = Differ.Steps(project.Snapshot(), Model.Parse(modelText));
+				if (command == "check")
+				{
+					if (steps.Empty())
+					{
+						Console.WriteLine("the model has no changes since the last migration");
+						return 0;
+					}
+					Console.WriteLine("the model has changes no migration has (larva nest migrate add Name):");
+					loop (str note in steps.Notes)
+						Console.WriteLine("  " + note);
+					return 1;
+				}
+				if (command == "script")
+				{
+					if (steps.Empty())
+						Console.WriteLine("-- no changes since the last migration");
+					loop (str note in steps.Notes)
+						Console.WriteLine("-- " + note);
+					loop (str sql in steps.Up)
+						Console.WriteLine(sql + ";");
+					return 0;
+				}
+				if (command == "add" && args.Count >= 3)
+					return Add(project, args[2], steps, modelText);
+				Console.Write(Usage());
+				return 2;
+			}
+
+		private:
+			static Add(Project project, str name, Steps steps, str modelText) : i32
+			{
+				if (!IsName(name))
+					throw new ToolError("a migration's name is a word of letters and digits (AddPhone)");
+				if (steps.Empty())
+				{
+					Console.WriteLine("the model has no changes since the last migration: nothing to add");
+					return 0;
+				}
+				Directory.CreateDirectory(project.Migrations);
+				List<str> existing = project.MigrationFiles();
+				i32 number = existing.Count + 1;
+				str id = Pad(number);
+				str className = "M" + id + "_" + name;
+				File.WriteAllText(Path.Combine(project.Migrations, className + ".ant"), Writer.Migration(project.Namespace, className, number, name, steps));
+				existing.Add(className + ".ant");
+				File.WriteAllText(Path.Combine(project.Migrations, "Migrations.ant"), Writer.Index(project.Namespace, existing));
+				File.WriteAllText(Path.Combine(project.Migrations, "model.txt"), modelText);
+				Console.WriteLine("added migrations/" + className + ".ant:");
+				loop (str note in steps.Notes)
+					Console.WriteLine("  " + note);
+				Console.WriteLine("apply it with db.Migrate(Migrations.All())");
+				return 0;
+			}
+
+			static IsName(str name) : bool
+			{
+				if (name.Length == 0 || name.Length > 80)
+					return false;
+				loop (i32 i = 0..name.Length)
+				{
+					u8 c = name[i];
+					bool letter = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z';
+					if (!letter && !(i > 0 && (c >= '0' && c <= '9' || c == '_')))
+						return false;
+				}
+				return true;
+			}
+
+			static Pad(i32 n) : str
+			{
+				str text = $"{n}";
+				loop (text.Length < 4)
+					text = "0" + text;
+				return text;
+			}
+	}
+
+	/// The Antril files migrations are.
+	public static class Writer
+	{
+		public:
+			static Migration(str space, str className, i32 number, str name, Steps steps) : str
+			{
+				StringBuilder text = new StringBuilder();
+				text.Append("// Made by `larva nest migrate add " + name + "`: from the model of the last migration to the code's.\n");
+				text.Append("// Edit it when data has to move (a column split, values computed): Up and Down run in a transaction.\n");
+				loop (str note in steps.Notes)
+					text.Append("//   " + note + "\n");
+				text.Append("\nimport Nest;\n\n");
+				str indent = Open(text, space);
+				text.Append(indent + "public final class " + className + " : Migration\n" + indent + "{\n");
+				text.Append(indent + "\tpublic:\n");
+				text.Append(indent + "\t\tnew() : base(" + $"{number}" + ", " + Literal(name) + ") { }\n\n");
+				Body(text, indent, "Up", steps.Up);
+				text.Append("\n");
+				Body(text, indent, "Down", steps.Down);
+				text.Append(indent + "}\n");
+				Close(text, space);
+				return text.ToString();
+			}
+
+			/// `Migrations.All()`: every migration, in order (made again with each one added).
+			static Index(str space, List<str> files) : str
+			{
+				StringBuilder text = new StringBuilder();
+				text.Append("// Made by `larva nest migrate add`: every migration, in order. db.Migrate(Migrations.All()) applies the ones a\n");
+				text.Append("// database has not had.\n\nimport System;\nimport Nest;\n\n");
+				str indent = Open(text, space);
+				text.Append(indent + "public static class Migrations\n" + indent + "{\n" + indent + "\tpublic:\n");
+				text.Append(indent + "\t\tstatic All() : List<Migration>\n" + indent + "\t\t{\n");
+				text.Append(indent + "\t\t\tList<Migration> all = new List<Migration>();\n");
+				loop (str file in files)
+					text.Append(indent + "\t\t\tall.Add(new " + file.Substring(0, file.Length - 4) + "());\n");
+				text.Append(indent + "\t\t\treturn all;\n" + indent + "\t\t}\n" + indent + "}\n");
+				Close(text, space);
+				return text.ToString();
+			}
+
+		private:
+			static Open(StringBuilder text, str space) : str
+			{
+				if (space.Length == 0)
+					return "";
+				text.Append("into namespace " + space + "\n{\n");
+				return "\t";
+			}
+
+			static Close(StringBuilder text, str space)
+			{
+				if (space.Length > 0)
+					text.Append("}\n");
+			}
+
+			static Body(StringBuilder text, str indent, str name, List<str> statements)
+			{
+				text.Append(indent + "\t\toverride " + name + "(Database db)\n" + indent + "\t\t{\n");
+				loop (str sql in statements)
+					text.Append(indent + "\t\t\tdb.Execute(" + Literal(sql) + ");\n");
+				text.Append(indent + "\t\t}\n");
+			}
+
+			/// `text` as an Antril string literal.
+			static Literal(str text) : str => "\"" + text.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+	}
+}
+
+Main() : i32
+{
+	try
+	{
+		return NestTool.Tool.Run(Environment.GetCommandLineArgs());
+	}
+	catch (NestTool.ToolError e)
+	{
+		Console.Error.WriteLine("larva nest: " + e.Message);
+		return 1;
+	}
+}

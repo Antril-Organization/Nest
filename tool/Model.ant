@@ -1,0 +1,320 @@
+// The model a project declares (its IModel class's Model(): a `table|Name` line per table, a
+// `column|Name|TYPE|flags|renamed-from` line per column), read back, and the SQL that takes one model to another.
+
+import System;
+
+into namespace NestTool
+{
+	public final class Column
+	{
+		public:
+			str Name;
+			str Type;
+			str Flags;
+			str From;
+
+			new(str Name, str Type, str Flags, str From);
+
+			IsKey() : bool => HasFlag("key");
+			IsUnique() : bool => HasFlag("unique");
+			NotNull() : bool => HasFlag("notnull");
+
+			HasFlag(str flag) : bool
+			{
+				loop (str part in Flags.Split(','))
+					if (part == flag)
+						return true;
+				return false;
+			}
+
+			/// Its definition in CREATE TABLE.
+			Definition() : str
+			{
+				str sql = Sql.Name(Name) + " " + Type;
+				if (IsKey())
+					sql = sql + " PRIMARY KEY";
+				else if (NotNull())
+					sql = sql + " NOT NULL";
+				if (IsUnique())
+					sql = sql + " UNIQUE";
+				return sql;
+			}
+
+			/// Its definition in ALTER TABLE ADD COLUMN: a NOT NULL column needs a value for the rows already there.
+			Added() : str => NotNull() ? Definition() + " DEFAULT " + Zero() : Definition();
+
+			/// The empty value of its type (what rows get when a NOT NULL column is added).
+			Zero() : str
+			{
+				if (Type == "TEXT")
+					return "''";
+				if (Type == "BLOB")
+					return "X''";
+				return "0";
+			}
+
+			/// A value of its type that differs row by row (a new UNIQUE NOT NULL column's, from the row's id).
+			Distinct() : str
+			{
+				if (Type == "TEXT")
+					return "'' || rowid";
+				if (Type == "BLOB")
+					return "CAST(rowid AS BLOB)";
+				return "rowid";
+			}
+
+			SameShape(Column other) : bool => Type == other.Type && Flags == other.Flags;
+	}
+
+	public final class TableModel
+	{
+		public:
+			str Name;
+			List<Column> Columns;
+
+			new(str Name) { this.Name = Name; Columns = new List<Column>(); }
+
+			Find(str name) : Column?
+			{
+				loop (Column c in Columns)
+					if (c.Name == name)
+						return c;
+				return null;
+			}
+
+			Create() : str
+			{
+				str sql = "CREATE TABLE " + Sql.Name(Name) + " (";
+				loop (i32 i = 0..Columns.Count)
+				{
+					if (i > 0)
+						sql = sql + ", ";
+					sql = sql + Columns[i].Definition();
+				}
+				return sql + ")";
+			}
+
+			Drop() : str => "DROP TABLE " + Sql.Name(Name);
+	}
+
+	public final class Model
+	{
+		public:
+			List<TableModel> Tables;
+
+			new() { Tables = new List<TableModel>(); }
+
+			Find(str name) : TableModel?
+			{
+				loop (TableModel t in Tables)
+					if (t.Name == name)
+						return t;
+				return null;
+			}
+
+			/// The model in `text` (Model()'s lines; other lines are skipped).
+			static Parse(str text) : Model
+			{
+				Model model = new Model();
+				TableModel? current = null;
+				loop (str raw in text.Split('\n'))
+				{
+					str line = raw.Trim();
+					List<str> parts = line.Split('|');
+					if (parts.Count == 2 && parts[0] == "table")
+					{
+						TableModel made = new TableModel(parts[1]);
+						model.Tables.Add(made);
+						current = made;
+					}
+					else if (parts.Count == 5 && parts[0] == "column" && current is TableModel table)
+						table.Columns.Add(new Column(parts[1], parts[2], parts[3], parts[4]));
+				}
+				return model;
+			}
+	}
+
+	/// SQL text.
+	public static class Sql
+	{
+		public:
+			/// A quoted name: `"Name"`.
+			static Name(str name) : str => "\"" + name.Replace("\"", "\"\"") + "\"";
+	}
+
+	/// What takes one model to another: the statements up, and the ones back down.
+	public final class Steps
+	{
+		public:
+			List<str> Up;
+			List<str> Down;
+			List<str> Notes;
+
+			new() { Up = new List<str>(); Down = new List<str>(); Notes = new List<str>(); }
+
+			Empty() : bool => Up.Count == 0;
+	}
+
+	public static class Differ
+	{
+		public:
+			/// The statements from `before` to `after` (SQLite): tables made or dropped; columns added, dropped or renamed in
+			/// place; any other change (a type, NOT NULL, UNIQUE, the key) by making the table again and copying its rows.
+			static Steps(Model before, Model after) : Steps
+			{
+				Steps steps = new Steps();
+				List<str> downTables = new List<str>();
+				loop (TableModel t in after.Tables)
+				{
+					if (before.Find(t.Name) is TableModel old)
+						Table(old, t, steps);
+					else
+					{
+						steps.Up.Add(t.Create());
+						downTables.Add(t.Drop());
+						steps.Notes.Add("table " + t.Name + " added");
+					}
+				}
+				loop (TableModel old in before.Tables)
+				{
+					if (after.Find(old.Name) == null)
+					{
+						steps.Up.Add(old.Drop());
+						downTables.Add(old.Create());
+						steps.Notes.Add("table " + old.Name + " dropped (its rows are lost)");
+					}
+				}
+				// Down undoes in the opposite order.
+				loop (i32 i = 0..downTables.Count)
+					steps.Down.Insert(0, downTables[i]);
+				return steps;
+			}
+
+		private:
+			static Table(TableModel old, TableModel now, Steps steps)
+			{
+				List<str> up = new List<str>();
+				List<str> down = new List<str>();
+				bool simple = true;
+				bool changed = false;
+				str table = Sql.Name(now.Name);
+				List<str> renamedFrom = new List<str>();
+				loop (Column c in now.Columns)
+				{
+					if (old.Find(c.Name) is Column same)
+					{
+						if (!same.SameShape(c))
+						{
+							simple = false;
+							changed = true;
+							steps.Notes.Add("column " + now.Name + "." + c.Name + " changed: " + same.Type + " " + same.Flags + " to " + c.Type + " " + c.Flags);
+						}
+						continue;
+					}
+					changed = true;
+					if (c.From.Length > 0 && old.Find(c.From) is Column source && now.Find(c.From) == null)
+					{
+						renamedFrom.Add(c.From);
+						up.Add("ALTER TABLE " + table + " RENAME COLUMN " + Sql.Name(c.From) + " TO " + Sql.Name(c.Name));
+						down.Insert(0, "ALTER TABLE " + table + " RENAME COLUMN " + Sql.Name(c.Name) + " TO " + Sql.Name(c.From));
+						steps.Notes.Add("column " + now.Name + "." + c.From + " renamed to " + c.Name);
+						if (!source.SameShape(c))
+							simple = false;
+						continue;
+					}
+					steps.Notes.Add("column " + now.Name + "." + c.Name + " added");
+					if (c.IsUnique() && c.NotNull())
+						steps.Notes.Add("column " + now.Name + "." + c.Name + " is UNIQUE: the rows already there get their id as its value (change that in Up if they need others)");
+					if (c.IsKey() || c.IsUnique())
+						simple = false;
+					up.Add("ALTER TABLE " + table + " ADD COLUMN " + c.Added());
+					down.Insert(0, "ALTER TABLE " + table + " DROP COLUMN " + Sql.Name(c.Name));
+				}
+				loop (Column c in old.Columns)
+				{
+					if (now.Find(c.Name) != null || Contains(renamedFrom, c.Name))
+						continue;
+					changed = true;
+					steps.Notes.Add("column " + old.Name + "." + c.Name + " dropped (its values are lost)");
+					if (c.IsKey() || c.IsUnique())
+						simple = false;
+					up.Add("ALTER TABLE " + table + " DROP COLUMN " + Sql.Name(c.Name));
+					down.Insert(0, "ALTER TABLE " + table + " ADD COLUMN " + c.Added());
+				}
+				if (!changed)
+					return;
+				if (simple)
+				{
+					steps.Up.AddRange(up);
+					Prepend(steps.Down, down);
+					return;
+				}
+				steps.Notes.Add("table " + now.Name + " is made again (SQLite cannot change those columns in place)");
+				steps.Up.AddRange(Rebuild(old, now));
+				Prepend(steps.Down, Rebuild(now, old));
+			}
+
+			/// `to` made as a new table, the rows of `from` copied into it (a column renamed keeps its values; a new NOT NULL
+			/// column gets its empty value), the old one dropped and the new one renamed.
+			static Rebuild(TableModel from, TableModel to) : List<str>
+			{
+				str temp = Sql.Name("__nest_new_" + to.Name);
+				str create = "CREATE TABLE " + temp + " (";
+				str columns = "";
+				str values = "";
+				loop (i32 i = 0..to.Columns.Count)
+				{
+					Column c = to.Columns[i];
+					if (i > 0)
+						create = create + ", ";
+					create = create + c.Definition();
+					str? source = null;
+					if (from.Find(c.Name) != null)
+						source = Sql.Name(c.Name);
+					else if (c.From.Length > 0 && from.Find(c.From) != null)
+						source = Sql.Name(c.From);
+					else
+					{
+						// Going back from a rename: the column the new name came from.
+						loop (Column back in from.Columns)
+							if (back.From == c.Name)
+								source = Sql.Name(back.Name);
+					}
+					if (source == null && c.NotNull() && !c.IsKey())
+						source = c.IsUnique() ? c.Distinct() : c.Zero();
+					if (source is str chosen)
+					{
+						if (columns.Length > 0)
+						{
+							columns = columns + ", ";
+							values = values + ", ";
+						}
+						columns = columns + Sql.Name(c.Name);
+						values = values + chosen;
+					}
+				}
+				List<str> sql = new List<str>();
+				sql.Add(create + ")");
+				if (columns.Length > 0)
+					sql.Add("INSERT INTO " + temp + " (" + columns + ") SELECT " + values + " FROM " + Sql.Name(from.Name));
+				sql.Add("DROP TABLE " + Sql.Name(from.Name));
+				sql.Add("ALTER TABLE " + temp + " RENAME TO " + Sql.Name(to.Name));
+				return sql;
+			}
+
+			/// `first`'s items before `items`'s, in their order.
+			static Prepend(List<str> items, List<str> first)
+			{
+				loop (i32 i = 0..first.Count)
+					items.Insert(i, first[i]);
+			}
+
+			static Contains(List<str> items, str item) : bool
+			{
+				loop (str x in items)
+					if (x == item)
+						return true;
+				return false;
+			}
+	}
+}

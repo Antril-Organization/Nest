@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+*.user
+# Signing keys never leave this machine.
+*.key
+*.pem

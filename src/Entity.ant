@@ -1,0 +1,231 @@
+// An entity: a class whose fields are a table's columns. `class User : IEntity<User>` is enough: the compiler writes the
+// functions below into User, one statement per field, so nothing about the class is looked up while the program runs.
+// Fields of these types map: integers, bool, f32, f64, str, u8[] (and str?, u8[]?, i64?, i32?, f64?, bool?: NULL allowed).
+
+import System;
+import System.Data;
+
+into namespace Nest
+{
+	public interface IEntity<TSelf : IEntity<TSelf>>
+	{
+		/// The table's name: the class's (write `static TableName() : str` in the class for another).
+		derive static TableName() : str => nameof(TSelf);
+
+		/// `CREATE TABLE IF NOT EXISTS …` with a column per field.
+		derive static CreateSql() : str
+		{
+			str sql = "CREATE TABLE IF NOT EXISTS \"" + TSelf.TableName() + "\" (";
+			bool first = true;
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>())
+				{
+					if (!first)
+						sql = sql + ", ";
+					first = false;
+					sql = sql + "\"" + f.Argument<ColumnAttribute>(0, nameof(f)) + "\" ";
+					static if (f.TypeName == "f64" || f.TypeName == "f32")
+						sql = sql + "REAL";
+					else static if (f.TypeName == "str")
+						sql = sql + "TEXT";
+					else static if (f.TypeName == "u8[]")
+						sql = sql + "BLOB";
+					else
+						sql = sql + "INTEGER";
+					static if (f.Has<KeyAttribute>())
+						sql = sql + " PRIMARY KEY";
+					else static if (!f.Nullable)
+						sql = sql + " NOT NULL";
+					static if (f.Has<UniqueAttribute>())
+						sql = sql + " UNIQUE";
+				}
+			}
+			return sql + ")";
+		}
+
+		/// The table as the model describes it (what migrations compare): `table|Name`, then a line per column,
+		/// `column|Name|TYPE|flags|renamed-from` (flags: key, notnull, unique, comma-separated).
+		derive static Schema() : str
+		{
+			str text = "table|" + TSelf.TableName() + "\n";
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>())
+				{
+					text = text + "column|" + f.Argument<ColumnAttribute>(0, nameof(f)) + "|";
+					static if (f.TypeName == "f64" || f.TypeName == "f32")
+						text = text + "REAL|";
+					else static if (f.TypeName == "str")
+						text = text + "TEXT|";
+					else static if (f.TypeName == "u8[]")
+						text = text + "BLOB|";
+					else
+						text = text + "INTEGER|";
+					str flags = "";
+					static if (f.Has<KeyAttribute>())
+						flags = "key";
+					else static if (!f.Nullable)
+						flags = "notnull";
+					static if (f.Has<UniqueAttribute>())
+						flags = flags.Length == 0 ? "unique" : flags + ",unique";
+					text = text + flags + "|" + f.Argument<RenamedAttribute>(0, "") + "\n";
+				}
+			}
+			return text;
+		}
+
+		/// The column of the field named `field` ("" when it is not one): what a query's `u.Name` reads.
+		derive static ColumnOf(str field) : str
+		{
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>())
+				{
+					if (field == nameof(f))
+						return f.Argument<ColumnAttribute>(0, nameof(f));
+				}
+			}
+			return "";
+		}
+
+		/// The columns, in the order rows are read: `"Id", "Name", …`.
+		derive static ColumnList() : str
+		{
+			str sql = "";
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>())
+				{
+					if (sql.Length > 0)
+						sql = sql + ", ";
+					sql = sql + "\"" + f.Argument<ColumnAttribute>(0, nameof(f)) + "\"";
+				}
+			}
+			return sql;
+		}
+
+		/// `INSERT INTO …`: every column but an integer key (the database makes it).
+		derive static InsertSql() : str
+		{
+			str columns = "";
+			str values = "";
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>() && !(f.Has<KeyAttribute>() && f.TypeName != "str"))
+				{
+					if (columns.Length > 0)
+					{
+						columns = columns + ", ";
+						values = values + ", ";
+					}
+					columns = columns + "\"" + f.Argument<ColumnAttribute>(0, nameof(f)) + "\"";
+					values = values + "?";
+				}
+			}
+			return "INSERT INTO \"" + TSelf.TableName() + "\" (" + columns + ") VALUES (" + values + ")";
+		}
+
+		/// ` WHERE "key" = ?`.
+		derive static KeyCondition() : str
+		{
+			str sql = "";
+			static loop (field F f in TSelf)
+			{
+				static if (f.Has<KeyAttribute>())
+					sql = " WHERE \"" + f.Argument<ColumnAttribute>(0, nameof(f)) + "\" = ?";
+			}
+			return sql;
+		}
+
+		/// `UPDATE … SET` every column but the key, the key last.
+		derive static UpdateSql() : str
+		{
+			str sets = "";
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>() && !f.Has<KeyAttribute>())
+				{
+					if (sets.Length > 0)
+						sets = sets + ", ";
+					sets = sets + "\"" + f.Argument<ColumnAttribute>(0, nameof(f)) + "\" = ?";
+				}
+			}
+			return "UPDATE \"" + TSelf.TableName() + "\" SET " + sets + TSelf.KeyCondition();
+		}
+
+		derive static DeleteSql() : str => "DELETE FROM \"" + TSelf.TableName() + "\"" + TSelf.KeyCondition();
+
+		derive static SelectSql() : str => "SELECT " + TSelf.ColumnList() + " FROM \"" + TSelf.TableName() + "\"";
+
+		/// Binds what InsertSql takes, from 1.
+		derive BindInsert(Command command)
+		{
+			i32 i = 1;
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>() && !(f.Has<KeyAttribute>() && f.TypeName != "str"))
+				{
+					command.Bind(i, this.f);
+					i++;
+				}
+			}
+		}
+
+		/// Binds what UpdateSql takes: the columns, then the key.
+		derive BindUpdate(Command command)
+		{
+			i32 i = 1;
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>() && !f.Has<KeyAttribute>())
+				{
+					command.Bind(i, this.f);
+					i++;
+				}
+			}
+			static loop (field F f in TSelf)
+			{
+				static if (f.Has<KeyAttribute>())
+					command.Bind(i, this.f);
+			}
+		}
+
+		/// Binds the key at `index`.
+		derive BindKey(Command command, i32 index)
+		{
+			static loop (field F f in TSelf)
+			{
+				static if (f.Has<KeyAttribute>())
+					command.Bind(index, this.f);
+			}
+		}
+
+		/// After an INSERT: the key the database made, into an integer key.
+		derive SetGeneratedKey(i64 key)
+		{
+			static loop (field F f in TSelf)
+			{
+				static if (f.Has<KeyAttribute>() && f.TypeName != "str")
+					this.f = (F)key;
+			}
+		}
+
+		/// The entity of the command's current row (its columns in ColumnList's order). The class needs a constructor
+		/// without parameters.
+		derive static Read(Command command) : TSelf
+		{
+			TSelf item = new TSelf();
+			i32 i = 0;
+			static loop (field F f in TSelf)
+			{
+				static if (!f.Has<IgnoreAttribute>())
+				{
+					item.f = command.Get(i, item.f);
+					i++;
+				}
+			}
+			return item;
+		}
+	}
+}

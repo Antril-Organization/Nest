@@ -1,0 +1,13 @@
+queen 1.0;
+
+chunk PROJ:
+   name: NestTool,
+   type: tool,
+   command: nest,
+   version: v0.4,
+   author: Antril Organization,
+   description: Migrations for Nest databases from the model the code declares
+
+chunk HIVE:
+   package: Antril-Organization/Nest.Tool,
+   license: MIT

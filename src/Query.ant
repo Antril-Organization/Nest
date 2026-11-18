@@ -1,0 +1,473 @@
+// Queries from functions: `db.Users.Where(u => u.Age >= limit).OrderBy(u => u.Name).Take(10)`. Each function is quoted
+// (`const func`): its tree becomes SQL the first time its place runs, kept with the statement prepared for it; what the
+// function takes from around it (`limit`) is bound as a parameter at each run. The SQL depends only on the places, so a
+// query runs again as bind and step.
+
+import System;
+import System.Data;
+
+into namespace Nest
+{
+	/// A function a query cannot say in SQL.
+	public class QueryError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// SQL from a quoted function's tree, with the captures it binds in order.
+	public final class SqlWriter
+	{
+		func<str> : str columnOf;
+		str table;
+
+		public:
+			/// The captures to bind, in the order of the SQL's `?`.
+			List<i32> Order;
+
+			new(func<str> : str columnOf, str table)
+			{
+				this.columnOf = columnOf;
+				this.table = table;
+				Order = new List<i32>();
+			}
+
+			/// The SQL of `node` (a capture is a `?`; the function's parameter's fields are columns).
+			Write(QuoteNode node) : str
+			{
+				QuoteKind kind = node.Kind;
+				if (kind == QuoteKind.Capture)
+				{
+					Order.Add(node.Index);
+					return "?";
+				}
+				if (kind == QuoteKind.Null)
+					return "NULL";
+				if (kind == QuoteKind.Member)
+					return Member(node);
+				if (kind == QuoteKind.Binary)
+					return Binary(node);
+				if (kind == QuoteKind.Unary)
+					return node.Name == "!" ? "(NOT " + Write(node.Children[0]) + ")" : "(" + node.Name + Write(node.Children[0]) + ")";
+				if (kind == QuoteKind.Conditional)
+					return "(CASE WHEN " + Write(node.Children[0]) + " THEN " + Write(node.Children[1]) + " ELSE " + Write(node.Children[2]) + " END)";
+				if (kind == QuoteKind.Call)
+					return Call(node);
+				if (kind == QuoteKind.Parameter)
+					throw new QueryError("a whole entity is not a value SQL compares (`u` alone): compare its fields (`u.Id`)");
+				throw new QueryError("`" + node.ToString() + "` cannot be said in SQL");
+			}
+
+		private:
+			Member(QuoteNode node) : str
+			{
+				QuoteNode of = node.Children[0];
+				if (of.Kind == QuoteKind.Parameter)
+				{
+					str column = columnOf(node.Name);
+					if (column.Length == 0)
+						throw new QueryError("`" + node.Name + "` is not a column of " + table);
+					return "\"" + column + "\"";
+				}
+				if (node.Name == "Length")
+					return "length(" + Write(of) + ")";
+				throw new QueryError("`" + node.ToString() + "`: a query reads the fields of its entity, not their members");
+			}
+
+			Binary(QuoteNode node) : str
+			{
+				QuoteNode left = node.Children[0];
+				QuoteNode right = node.Children[1];
+				str op = node.Name;
+				// `x == null`, `x != null`: IS NULL, IS NOT NULL.
+				if ((op == "==" || op == "!=") && (left.Kind == QuoteKind.Null || right.Kind == QuoteKind.Null))
+				{
+					QuoteNode value = left.Kind == QuoteKind.Null ? right : left;
+					return "(" + Write(value) + (op == "==" ? " IS NULL)" : " IS NOT NULL)");
+				}
+				str sql = op;
+				if (op == "&&")
+					sql = "AND";
+				else if (op == "||")
+					sql = "OR";
+				else if (op == "==")
+					sql = "=";
+				else if (op == "!=")
+					sql = "<>";
+				else if (op == "??")
+					return "coalesce(" + Write(left) + ", " + Write(right) + ")";
+				else if (op != "<" && op != "<=" && op != ">" && op != ">=" && op != "+" && op != "-" && op != "*" && op != "/" && op != "%")
+					throw new QueryError("`" + op + "` cannot be said in SQL");
+				return "(" + Write(left) + " " + sql + " " + Write(right) + ")";
+			}
+
+			Call(QuoteNode node) : str
+			{
+				str of = Write(node.Children[0]);
+				i32 arguments = node.Children.Length - 1;
+				if (node.Name == "StartsWith" && arguments == 1)
+				{
+					str part = Write(node.Children[1]);
+					str again = Write(node.Children[1]);
+					return "(substr(" + of + ", 1, length(" + part + ")) = " + again + ")";
+				}
+				if (node.Name == "EndsWith" && arguments == 1)
+				{
+					str part = Write(node.Children[1]);
+					str again = Write(node.Children[1]);
+					str third = Write(node.Children[1]);
+					return "(length(" + part + ") = 0 OR substr(" + of + ", -length(" + again + ")) = " + third + ")";
+				}
+				if (node.Name == "Contains" && arguments == 1)
+					return "(instr(" + of + ", " + Write(node.Children[1]) + ") > 0)";
+				if (node.Name == "ToUpper" && arguments == 0)
+					return "upper(" + of + ")";
+				if (node.Name == "ToLower" && arguments == 0)
+					return "lower(" + of + ")";
+				if (node.Name == "Trim" && arguments == 0)
+					return "trim(" + of + ")";
+				throw new QueryError("`" + node.ToString() + "`: `" + node.Name + "` cannot be said in SQL");
+			}
+	}
+
+	/// The translators the build runs on queries' functions (`[CompileWith]`): a function's SQL, then `|#|`, then the
+	/// captures it binds in order (`3,0`); `!` and why, when SQL cannot say it (an error of the build).
+	public static class Sql
+	{
+		const str Separator = "|#|";
+
+		public:
+			static Where<T : IEntity<T>, class, new()>(QuoteNode tree) : str => Translate(tree, name => T.ColumnOf(name), T.TableName());
+
+			static Order<T : IEntity<T>, class, new()>(QuoteNode tree) : str => Translate(tree, name => T.ColumnOf(name), T.TableName());
+
+			/// A translation's SQL; its captures go to `order`.
+			static Split(str compiled, List<i32> order) : str
+			{
+				i32 at = compiled.IndexOf(Separator);
+				if (at < 0)
+					return compiled;
+				str rest = compiled.Substring(at + Separator.Length);
+				if (rest.Length > 0)
+					loop (str part in rest.Split(','))
+						order.Add(Int32.Parse(part));
+				return compiled.Substring(0, at);
+			}
+
+		private:
+			static Translate(QuoteNode tree, func<str> : str columnOf, str table) : str
+			{
+				try
+				{
+					SqlWriter writer = new SqlWriter(columnOf, table);
+					str sql = writer.Write(tree);
+					str order = "";
+					loop (i32 index in writer.Order)
+						order = order.Length == 0 ? $"{index}" : order + $",{index}";
+					return sql + Separator + order;
+				}
+				catch (QueryError e)
+				{
+					return "!" + e.Message;
+				}
+			}
+	}
+
+	/// A statement made for a query's places, and which capture goes in each of its `?` (filter, capture).
+	public final class Prepared
+	{
+		public:
+			Command Command;
+			i32[] Filters;
+			i32[] Captures;
+
+			new(Command Command, i32[] Filters, i32[] Captures);
+	}
+
+	/// What a query asks of its table; run when it is walked (`loop (User u in query)`) or asked for a result. Its
+	/// statement is found by a number made of its places (each Where and OrderBy's) and what it asks (rows, a count, a
+	/// delete): the same places, the same statement, prepared once.
+	public final class Query<T : IEntity<T>, class, new()>
+	{
+		const i64 Rows = 1;
+		const i64 Counting = 2;
+		const i64 Deleting = 3;
+
+		Table<T> table;
+		List<Quoted<func<T> : bool>>? filters;
+		List<QuoteNode>? orders;
+		List<str>? orderCompiled;
+		List<bool>? descending;
+		i64 limit;
+		i64 offset;
+		i64 key;
+
+		public:
+			new(Table<T> table)
+			{
+				this.table = table;
+				limit = -1;
+				offset = 0;
+				key = 17;
+			}
+
+			/// Only the rows `test` holds for (all the filters: AND).
+			Where([CompileWith("Nest.Sql.Where")] const func<T> : bool test) : Query<T>
+			{
+				if (filters is List<Quoted<func<T> : bool>> kept)
+					kept.Add(test);
+				else
+				{
+					List<Quoted<func<T> : bool>> made = new List<Quoted<func<T> : bool>>();
+					made.Add(test);
+					filters = made;
+				}
+				key = Mix(key, test.Site * 4 + 1);
+				return this;
+			}
+
+			/// In the order of `field` (`u => u.Name`), then of the orders after it.
+			OrderBy<K>([CompileWith("Nest.Sql.Order")] const func<T> : K field) : Query<T> => Order(field.Body, field.Compiled, field.Site, false);
+
+			OrderByDescending<K>([CompileWith("Nest.Sql.Order")] const func<T> : K field) : Query<T> => Order(field.Body, field.Compiled, field.Site, true);
+
+			/// At most `count` rows.
+			Take(i64 count) : Query<T>
+			{
+				limit = count;
+				return this;
+			}
+
+			/// Without the first `count` rows.
+			Skip(i64 count) : Query<T>
+			{
+				offset = count;
+				return this;
+			}
+
+			/// The rows, one at a time.
+			Iterator() : Iterator<T>
+			{
+				i64 which = Which(Rows);
+				Prepared prepared = table.Statement(which, this);
+				Command command = prepared.Command;
+				try
+				{
+					BindAll(prepared, true);
+					loop (command.Step())
+						yield T.Read(command);
+				}
+				finally
+				{
+					table.Release(which, prepared);
+				}
+			}
+
+			/// The first row, or null.
+			First() : T?
+			{
+				i64 kept = limit;
+				limit = 1;
+				T? found = null;
+				loop (T item in Iterator())
+				{
+					found = item;
+					break;
+				}
+				limit = kept;
+				return found;
+			}
+
+			ToList() : List<T>
+			{
+				List<T> all = new List<T>();
+				loop (T item in Iterator())
+					all.Add(item);
+				return all;
+			}
+
+			/// How many rows the filters let through.
+			Count() : i64
+			{
+				i64 which = Which(Counting);
+				Prepared prepared = table.Statement(which, this);
+				BindAll(prepared, false);
+				i64 count = prepared.Command.Step() ? prepared.Command.GetI64(0) : 0;
+				table.Release(which, prepared);
+				return count;
+			}
+
+			Any() : bool => Count() > 0;
+
+			/// Deletes the rows the filters let through, without reading them: how many.
+			Delete() : i64
+			{
+				i64 which = Which(Deleting);
+				Prepared prepared = table.Statement(which, this);
+				BindAll(prepared, false);
+				prepared.Command.Step();
+				i64 changed = table.Changes();
+				table.Release(which, prepared);
+				return changed;
+			}
+
+			/// The statement `which` (Which) names, prepared on `connection`, with its binding plan.
+			Prepare(Connection connection, i64 which) : Prepared
+			{
+				List<i32> filterOf = new List<i32>();
+				List<i32> captureOf = new List<i32>();
+				str sql = Sql(which % 4, filterOf, captureOf);
+				return new Prepared(connection.Prepare(sql), filterOf.ToArray(), captureOf.ToArray());
+			}
+
+			/// The SQL of what the query asks (Rows, Counting, Deleting), and which capture each `?` binds.
+			Sql(i64 asked, List<i32> filterOf, List<i32> captureOf) : str
+			{
+				SqlWriter writer = new SqlWriter(name => T.ColumnOf(name), T.TableName());
+				str where = Conditions(writer, filterOf, captureOf);
+				if (asked == Counting)
+					return "SELECT count(*) FROM \"" + T.TableName() + "\"" + where;
+				if (asked == Deleting)
+					return "DELETE FROM \"" + T.TableName() + "\"" + where;
+				str sql = T.SelectSql() + where;
+				if (orders is List<QuoteNode> ordered && descending is List<bool> down && orderCompiled is List<str> made)
+				{
+					sql = sql + " ORDER BY ";
+					loop (i32 i = 0..ordered.Count)
+					{
+						if (i > 0)
+							sql = sql + ", ";
+						str key = made[i].Length > 0 ? Sql.Split(made[i], new List<i32>()) : writer.Write(ordered[i]);
+						sql = sql + key + (down[i] ? " DESC" : "");
+					}
+				}
+				if (limit >= 0 || offset > 0)
+					sql = sql + " LIMIT ? OFFSET ?";
+				return sql;
+			}
+
+		private:
+			static Mix(i64 a, i64 b) : i64 => (a * 1000003) ^ b;
+
+			/// The number of the statement: the places, what is asked, and whether it pages (its low two bits: what is asked).
+			Which(i64 asked) : i64
+			{
+				bool paging = asked == Rows && (limit >= 0 || offset > 0);
+				return (Mix(key, paging ? 2 : 1) & 0x3FFFFFFFFFFFFFFC) | asked;
+			}
+
+			Order(QuoteNode field, str? compiled, i64 site, bool down) : Query<T>
+			{
+				if (orders is List<QuoteNode> kept && descending is List<bool> flags && orderCompiled is List<str> texts)
+				{
+					kept.Add(field);
+					flags.Add(down);
+					texts.Add(compiled ?? "");
+				}
+				else
+				{
+					List<QuoteNode> made = new List<QuoteNode>();
+					made.Add(field);
+					List<bool> madeFlags = new List<bool>();
+					madeFlags.Add(down);
+					List<str> madeTexts = new List<str>();
+					madeTexts.Add(compiled ?? "");
+					orders = made;
+					descending = madeFlags;
+					orderCompiled = madeTexts;
+				}
+				key = Mix(key, site * 4 + (down ? 3 : 2));
+				return this;
+			}
+
+			Conditions(SqlWriter writer, List<i32> filterOf, List<i32> captureOf) : str
+			{
+				if (filters is not List<Quoted<func<T> : bool>> all)
+					return "";
+				str where = " WHERE ";
+				loop (i32 i = 0..all.Count)
+				{
+					if (i > 0)
+						where = where + " AND ";
+					// Translated by the build when it could (Sql.Where), else now.
+					List<i32> order = new List<i32>();
+					if (all[i].Compiled is str compiled)
+						where = where + Sql.Split(compiled, order);
+					else
+					{
+						writer.Order.Clear();
+						try
+						{
+							where = where + writer.Write(all[i].Body);
+						}
+						catch (QueryError e)
+						{
+							throw new QueryError(all[i].Place + ": " + e.Message);
+						}
+						order.AddRange(writer.Order);
+					}
+					loop (i32 index in order)
+					{
+						filterOf.Add(i);
+						captureOf.Add(index);
+					}
+				}
+				return where;
+			}
+
+			/// The filters' captures, by the statement's plan; then the paging.
+			BindAll(Prepared prepared, bool paging)
+			{
+				Command command = prepared.Command;
+				i32[] filterOf = prepared.Filters;
+				i32[] captureOf = prepared.Captures;
+				if (filters is List<Quoted<func<T> : bool>> all)
+				{
+					loop (i32 i = 0..filterOf.Length)
+						Values.Bind(command, i + 1, all[filterOf[i]].Captures[captureOf[i]]);
+				}
+				if (paging && (limit >= 0 || offset > 0))
+				{
+					command.Bind(filterOf.Length + 1, limit);
+					command.Bind(filterOf.Length + 2, offset);
+				}
+			}
+	}
+
+	/// A captured value bound by what it holds.
+	public static class Values
+	{
+		public:
+			static Bind(Command command, i32 index, any? value)
+			{
+				if (value is i64 a)
+					command.Bind(index, a);
+				else if (value is i32 b)
+					command.Bind(index, b);
+				else if (value is str c)
+					command.Bind(index, c);
+				else if (value is f64 d)
+					command.Bind(index, d);
+				else if (value is bool e)
+					command.Bind(index, e);
+				else if (value is i16 h)
+					command.Bind(index, h);
+				else if (value is u16 k)
+					command.Bind(index, k);
+				else if (value is u32 m)
+					command.Bind(index, m);
+				else if (value is u64 n)
+					command.Bind(index, n);
+				else if (value is i8 o)
+					command.Bind(index, o);
+				else if (value is u8 p)
+					command.Bind(index, p);
+				else if (value is f32 q)
+					command.Bind(index, q);
+				else if (value == null)
+					command.BindNull(index);
+				else
+					throw new QueryError("a value of a type SQL does not take was captured");
+			}
+	}
+}
