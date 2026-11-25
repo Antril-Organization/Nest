@@ -30,7 +30,7 @@ into namespace NestTool
 			{
 				str? queen = Environment.GetEnvironmentVariable("LARVA_PROJECT");
 				if (queen is not str file)
-					throw new ToolError("run it in a project (a folder with a .queen file): larva nest …");
+					throw new ToolError("run it in a project (a folder with its project.queen): larva nest …");
 				Queen = file;
 				Folder = Path.GetDirectoryName(file);
 				Migrations = Path.Combine(Folder, "migrations");

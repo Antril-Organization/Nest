@@ -119,4 +119,4 @@ What a migration does (SQLite):
 ## Layout
 
 - `src/`: the library (`Nest.dll`: `larva lib -o bin/Nest.dll src/*.ant`)
-- `tool/`: the tool (`Nest.Tool.queen`, `type: tool`, command `nest`)
+- `tool/`: the tool (`tool/project.queen`, `type: tool`, command `nest`)
