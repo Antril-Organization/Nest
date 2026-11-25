@@ -1,0 +1,14 @@
+tqueen 1.0;
+
+// Nest's settings for a project: `nest.queen` next to its `project.queen`. The tool (`larva nest`) reads it; without
+// one, it takes the defaults. Larva checks and completes the file with this profile wherever Nest is one of the
+// project's tools (TOOLS) or the user's.
+
+profile nest: "Nest's settings for a project: its model and its migrations."
+
+/// How `larva nest` finds the project's model and keeps its migrations.
+chunk NEST:
+   /// The model: the class that implements `IModel` (by its name, or with its namespace). Needed when the project has more than one; `--db Name` chooses one for a single command.
+   model: NAME  example "Shop.Data.ShopDb"
+   /// Where migrations are written and read: a folder under the project.
+   migrations: RPATH = migrations  example "data/migrations"
