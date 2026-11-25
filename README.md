@@ -108,6 +108,25 @@ edit them when data has to move. `migrations/Migrations.ant` lists them (`Migrat
 pending ones, each in a transaction, noted in the database's `__nest_migrations` table; `db.Revert(all, n)` undoes those
 after number `n`.
 
+### Settings: `nest.queen`
+
+A project can say how `larva nest` works in a `nest.queen` next to its `project.queen`. The tool brings its profile
+(`tool/profiles/nest/template.tqueen`), so where it is installed the editor checks and completes the file, and the tool
+reads it with `larva queen read`. Without one, the defaults apply.
+
+```queen
+queen 1.0;
+
+chunk NEST:
+   model: Shop.Data.ShopDb,
+   migrations: data/migrations
+```
+
+| Key | What it says |
+|---|---|
+| `model` | the IModel class (by its name, or with its namespace): needed when the project has more than one; `--db Name` wins for one command |
+| `migrations` | the folder, under the project, where migrations are written and read (default `migrations`) |
+
 What a migration does (SQLite):
 
 - a table added or dropped: `CREATE TABLE` / `DROP TABLE`;
@@ -119,4 +138,4 @@ What a migration does (SQLite):
 ## Layout
 
 - `src/`: the library (`Nest.dll`: `larva lib -o bin/Nest.dll src/*.ant`)
-- `tool/`: the tool (`Nest.Tool.queen`, `type: tool`, command `nest`)
+- `tool/`: the tool (`tool/project.queen`, `type: tool`, command `nest`), and its queen profile (`tool/profiles/nest/`)

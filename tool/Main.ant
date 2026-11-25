@@ -5,6 +5,7 @@
 import System;
 import System.IO;
 import System.Diagnostics;
+import System.Text;
 
 into namespace NestTool
 {
@@ -30,13 +31,62 @@ into namespace NestTool
 			{
 				str? queen = Environment.GetEnvironmentVariable("LARVA_PROJECT");
 				if (queen is not str file)
-					throw new ToolError("run it in a project (a folder with a .queen file): larva nest …");
+					throw new ToolError("run it in a project (a folder with its project.queen): larva nest …");
 				Queen = file;
 				Folder = Path.GetDirectoryName(file);
 				Migrations = Path.Combine(Folder, "migrations");
 				ModelClass = "";
 				Namespace = "";
-				FindModel(chosen);
+				// The project's settings (`nest.queen`, checked against Nest's profile): `--db` wins over its `model`.
+				str? model = chosen;
+				str settings = Path.Combine(Folder, "nest.queen");
+				if (File.Exists(settings))
+				{
+					JsonValue nest = Settings(settings);
+					if (nest.Get("migrations") is JsonValue migrations)
+						Migrations = Path.Combine(Folder, migrations.AsString);
+					if (model is null && nest.Get("model") is JsonValue named)
+						model = named.AsString;
+				}
+				FindModel(model);
+			}
+
+			/// The NEST chunk of `nest.queen`, as `larva queen read` gives it (checked, with the defaults): its problems end the command.
+			static Settings(str path) : JsonValue
+			{
+				// (`larva queen read` writes the JSON on its output; anything before its `{` is larva's own lines.)
+				str? larva = Environment.GetEnvironmentVariable("LARVA_EXE");
+				if (larva is not str exe)
+					throw new ToolError("LARVA_EXE is not set: run the tool as `larva nest …`");
+				ProcessResult read = Process.Run(exe, "queen read " + Quote(path));
+				i32 start = read.Output.IndexOf("{");
+				if (start < 0)
+					throw new ToolError("nest.queen could not be read: " + read.Output.Trim());
+				JsonValue json = JsonValue.Parse(read.Output.Substring(start));
+				if (read.ExitCode != 0)
+				{
+					StringBuilder problems = new StringBuilder();
+					if (json.Get("diagnostics") is JsonValue diagnostics)
+						loop (i32 i = 0..diagnostics.Count)
+						{
+							JsonValue d = diagnostics.At(i);
+							if (d.Get("error") is JsonValue error && error.AsBool)
+								problems.Append("\n  nest.queen(" + Field(d, "line") + "," + Field(d, "column") + "): " + Field(d, "code") + ": " + Field(d, "message"));
+						}
+					throw new ToolError("nest.queen has errors:" + problems.ToString());
+				}
+				if (json.Get("chunks") is JsonValue chunks && chunks.Get("NEST") is JsonValue nest)
+					return nest;
+				return JsonValue.NewObject();
+			}
+
+			/// A member of a JSON object as text (a string's text, a number as written), or "" when it is not there.
+			static Field(JsonValue item, str key) : str
+			{
+				if (item.Get(key) is not JsonValue value)
+					return "";
+				str written = value.ToString();
+				return written.StartsWith("\"") ? value.AsString : written;
 			}
 
 			/// The model the code declares now (built and run: a few seconds).
@@ -97,7 +147,7 @@ into namespace NestTool
 				Scan(Folder, classes, spaces);
 				loop (i32 i = 0..classes.Count)
 				{
-					if (chosen is str name && classes[i] != name)
+					if (chosen is str name && classes[i] != name && spaces[i] + "." + classes[i] != name)
 						continue;
 					if (ModelClass.Length > 0)
 						throw new ToolError("the project has more than one IModel class: choose one with --db Name");
